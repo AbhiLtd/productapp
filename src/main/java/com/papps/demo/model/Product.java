@@ -1,6 +1,6 @@
 package com.papps.demo.model;
 
-import lombok.AllArgsConstructor;
+/*import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
@@ -8,7 +8,7 @@ import lombok.ToString;
 @Setter
 @Getter
 @ToString //@Data
-@AllArgsConstructor
+@AllArgsConstructor*/
 public class Product {
 
 	private Integer id;
@@ -19,7 +19,6 @@ public class Product {
     	
     }
 	public Product(Integer id, String name, Long price) {
-		super();
 		this.id = id;
 		this.name = name;
 		this.price = price;
