@@ -23,8 +23,7 @@ jobs:
         cache: maven
         
     - name: Build with Maven
-      run: mvn clean install # mvn -B package --file pom.xml
+      run:  mvn clean install
 
     - name: Run Spring Boot Application
-      run: java -jar target/*.jar & # Start the Spring Boot application in the background
-      # The '&' runs the process in the background, allowing the workflow to continue.
+      run:  java -jar target/*.jar &
