@@ -1,9 +1,12 @@
-# Complete CI/CD workflow (GHCR variant) with immutable promotions using job outputs.
-# - build: Maven package + compute lowercase image name and short sha tag, upload JAR artifact
-# - build_and_push_dev: buildx multi-arch build, push :dev and :<sha>, capture digest and metadata artifact, optional Trivy scan
-# - promote_to_stage: pull by digest and retag to :stage and :<sha>, export outputs for downstream job
-# - promote_to_prod: depends only on promote_to_stage, reads outputs from promote_to_stage and retags to :prod and :<sha>
-name: Java CI/CD with Maven and GHCR (multi-arch + immutable promotions)
+# CI/CD: Maven build -> upload JAR -> multi-arch build & push to GHCR -> immutable promote dev->stage->prod
+# This version uses the "dependency chain" approach: promote_to_stage exports outputs,
+# promote_to_prod depends only on promote_to_stage and reads its outputs.
+#
+# Notes:
+# - Provide GHCR_USERNAME & GHCR_PAT (recommended) in repository secrets; if not present, the workflow falls back to GITHUB_TOKEN.
+# - Push/promote jobs are skipped for pull_request events (forked PRs mask secrets).
+# - The workflow assumes a single runnable JAR is produced at target/*.jar.
+name: Java CI/CD with Maven and GHCR (stable)
 
 on:
   push:
@@ -43,7 +46,6 @@ jobs:
       - name: Set image sha tag
         id: set_tag
         run: |
-          # short sha tag (7 chars)
           echo "sha_tag=$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - name: Set lowercase image name (owner/repo -> lowercased)
@@ -59,15 +61,15 @@ jobs:
           path: target/*.jar
 
   build_and_push_dev:
-    name: Build & push Docker image (dev) + optional scan
+    name: Build & push Docker image (dev)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     needs: build
     environment: dev
     outputs:
-      image_digest: ${{ steps.build_image.outputs.digest }}
-      image_name: ${{ needs.build.outputs.image_name }}
-      sha_tag: ${{ needs.build.outputs.sha_tag }}
+      image_digest: ${{ steps.set_outputs.outputs.image_digest }}
+      image_name: ${{ steps.set_outputs.outputs.image_name }}
+      sha_tag: ${{ steps.set_outputs.outputs.sha_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,11 +93,6 @@ jobs:
           username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Show image refs
-        run: |
-          echo "Image base: ${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}"
-          echo "Tags: dev and ${{ needs.build.outputs.sha_tag }}"
-
       - name: Build & push image (multi-arch) and capture digest
         id: build_image
         uses: docker/build-push-action@v4
@@ -112,39 +109,33 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Save digest and metadata artifact
+      - name: Set job outputs (image metadata)
+        id: set_outputs
         run: |
           DIGEST="${{ steps.build_image.outputs.digest }}"
-          echo "digest=${DIGEST}"
-          echo "${DIGEST}" > image-digest.txt
-          # create a small JSON without a heredoc to avoid YAML parsing issues
-          echo "{\"image\":\"${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}\",\"digest\":\"${DIGEST}\",\"sha_tag\":\"${{ needs.build.outputs.sha_tag }}\"}" > image-metadata.json
+          IMAGE_NAME="${{ needs.build.outputs.image_name }}"
+          SHA_TAG="${{ needs.build.outputs.sha_tag }}"
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: build step produced empty digest" >&2
+            exit 1
+          fi
+          echo "image_digest=${DIGEST}" >> $GITHUB_OUTPUT
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "sha_tag=${SHA_TAG}" >> $GITHUB_OUTPUT
 
-      - name: Upload digest artifact
+      - name: Upload metadata artifact
+        run: |
+          echo "${{ steps.set_outputs.outputs.image_digest }}" > image-digest.txt || true
+          printf '{"image":"%s","digest":"%s","sha_tag":"%s"}\n' "${{ env.REGISTRY }}/${{ steps.set_outputs.outputs.image_name }}" "${{ steps.set_outputs.outputs.image_digest }}" "${{ steps.set_outputs.outputs.sha_tag }}" > image-metadata.json || true
+        shell: bash
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: image-digest
+          name: image-metadata
           path: |
             image-digest.txt
             image-metadata.json
-
-      - name: Optional: Scan image with Trivy (if tools/scan-image.sh exists)
-        id: run_trivy
-        run: |
-          if [ -x ./tools/scan-image.sh ]; then
-            IMAGE_REF="${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}@${{ steps.build_image.outputs.digest }}"
-            ./tools/scan-image.sh "$IMAGE_REF" trivy-report.json
-            echo "found=true" >> $GITHUB_OUTPUT
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload Trivy report (if present)
-        if: ${{ steps.run_trivy.outputs.found == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-report
-          path: trivy-report.json
 
   promote_to_stage:
     name: Promote to stage (immutable via digest) and export outputs
@@ -171,7 +162,7 @@ jobs:
           REG="${{ env.REGISTRY }}"
           IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
           DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
-          SHA_TAG="${{ needs.build.outputs.sha_tag }}"
+          SHA_TAG="${{ needs.build_and_push_dev.outputs.sha_tag }}"
 
           echo "Promoting digest: ${DIGEST}"
           if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
@@ -185,10 +176,9 @@ jobs:
           docker push "${REG}/${IMG}:stage"
           docker push "${REG}/${IMG}:${SHA_TAG}"
 
-      - name: Set job outputs for promote_to_stage
+      - name: Set outputs for promote_to_stage
         id: set_outputs
         run: |
-          # Pass through values from build_and_push_dev so promote_to_prod can read them from needs.promote_to_stage.outputs
           echo "image_digest=${{ needs.build_and_push_dev.outputs.image_digest }}" >> $GITHUB_OUTPUT
           echo "image_name=${{ needs.build_and_push_dev.outputs.image_name }}" >> $GITHUB_OUTPUT
           echo "sha_tag=${{ needs.build_and_push_dev.outputs.sha_tag }}" >> $GITHUB_OUTPUT
