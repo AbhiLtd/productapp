@@ -143,70 +143,83 @@ jobs:
           path: trivy-report.json
 
   promote_to_stage:
-    name: Promote to stage (immutable via digest)
-    if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
-    needs: build_and_push_dev
-    environment: stage
-    steps:
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.GHCR_USERNAME || github.actor }}
-          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+  name: Promote to stage (immutable via digest)
+  if: ${{ github.event_name != 'pull_request' }}
+  runs-on: ubuntu-latest
+  needs: build_and_push_dev
+  environment: stage
+  outputs:
+    image_digest: ${{ steps.set_outputs.outputs.image_digest }}
+    image_name: ${{ steps.set_outputs.outputs.image_name }}
+    sha_tag: ${{ steps.set_outputs.outputs.sha_tag }}
+  steps:
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.GHCR_USERNAME || github.actor }}
+        password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Pull by digest and push stage & sha tags
-        run: |
-          set -e
-          REG="${{ env.REGISTRY }}"
-          IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
-          DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
-          SHA_TAG="${{ needs.build_and_push_dev.outputs.sha_tag }}"
+    - name: Pull by digest and push stage & sha tags
+      id: promote_stage
+      run: |
+        set -e
+        REG="${{ env.REGISTRY }}"
+        IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
+        DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
+        SHA_TAG="${{ needs.build_and_push_dev.outputs.sha_tag }}"
 
-          echo "Promoting digest: ${DIGEST}"
-          # validate variables
-          if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
-            echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
-            exit 1
-          fi
+        echo "Promoting digest: ${DIGEST}"
+        if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
+          echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
+          exit 1
+        fi
 
-          docker pull "${REG}/${IMG}@${DIGEST}"
-          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:stage"
-          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
-          docker push "${REG}/${IMG}:stage"
-          docker push "${REG}/${IMG}:${SHA_TAG}"
+        docker pull "${REG}/${IMG}@${DIGEST}"
+        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:stage"
+        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
+        docker push "${REG}/${IMG}:stage"
+        docker push "${REG}/${IMG}:${SHA_TAG}"
 
-  promote_to_prod:
-    name: Promote to prod (immutable via digest)
-    if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
-    needs: promote_to_stage
-    environment: prod
-    steps:
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.GHCR_USERNAME || github.actor }}
-          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+    - name: Set job outputs for promote_to_stage
+      id: set_outputs
+      run: |
+        # Export values from the upstream build_and_push_dev outputs so promote_to_prod can read them
+        echo "image_digest=${{ needs.build_and_push_dev.outputs.image_digest }}" >> $GITHUB_OUTPUT
+        echo "image_name=${{ needs.build_and_push_dev.outputs.image_name }}" >> $GITHUB_OUTPUT
+        echo "sha_tag=${{ needs.build_and_push_dev.outputs.sha_tag }}" >> $GITHUB_OUTPUT
 
-      - name: Pull by digest and push prod & sha tags
-        run: |
-          set -e
-          REG="${{ env.REGISTRY }}"
-          IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
-          DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
-          SHA_TAG="${{ needs.build_and_push_dev.outputs.sha_tag }}"
+# promote_to_prod: depends only on promote_to_stage and reads outputs from it
+promote_to_prod:
+  name: Promote to prod (immutable via digest)
+  if: ${{ github.event_name != 'pull_request' }}
+  runs-on: ubuntu-latest
+  needs: promote_to_stage
+  environment: prod
+  steps:
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.GHCR_USERNAME || github.actor }}
+        password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-          echo "Promoting digest: ${DIGEST}"
-          if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
-            echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
-            exit 1
-          fi
+    - name: Pull by digest and push prod & sha tags
+      run: |
+        set -e
+        REG="${{ env.REGISTRY }}"
+        IMG="${{ needs.promote_to_stage.outputs.image_name }}"
+        DIGEST="${{ needs.promote_to_stage.outputs.image_digest }}"
+        SHA_TAG="${{ needs.promote_to_stage.outputs.sha_tag }}"
 
-          docker pull "${REG}/${IMG}@${DIGEST}"
-          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:prod"
-          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
-          docker push "${REG}/${IMG}:prod"
-          docker push "${REG}/${IMG}:${SHA_TAG}"
+        echo "Promoting digest: ${DIGEST}"
+        if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
+          echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
+          exit 1
+        fi
+
+        docker pull "${REG}/${IMG}@${DIGEST}"
+        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:prod"
+        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
+        docker push "${REG}/${IMG}:prod"
+        docker push "${REG}/${IMG}:${SHA_TAG}"
