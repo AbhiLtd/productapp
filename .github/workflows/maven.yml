@@ -105,7 +105,9 @@ jobs:
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Show image reference
-        run: echo "Pushing image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev and :${{ needs.build.outputs.sha_tag }}"
+        run: |
+          echo "Pushing image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev"
+          echo "Also tagging with: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.sha_tag }}"
 
       - name: Build & push image (dev + sha) and capture digest
         id: build_image
