@@ -1,15 +1,18 @@
-# Example Dockerfile for a Maven-built fat/uber JAR
-# It expects the built jar to be supplied at build time via build-arg JAR_FILE
-FROM eclipse-temurin:17-jre-alpine AS runtime
-
+# Optimized, multi-arch-friendly, secure Dockerfile for a Java 17 runnable JAR (recommended)
+# - Uses Temurin jammy to stage the JAR; final runtime uses distroless nonroot.
+# - Keep final image minimal and non-root.
+FROM eclipse-temurin:17-jre-jammy AS extractor
 ARG JAR_FILE=target/*.jar
-WORKDIR /app
-
-# Copy the JAR (the workflow builds and passes artifact into the build context)
-# When using docker build locally, ensure a JAR exists at the specified path.
+WORKDIR /workspace
 COPY ${JAR_FILE} app.jar
+RUN [ -f /workspace/app.jar ]
 
-ENV JAVA_OPTS=""
+FROM gcr.io/distroless/java17-debian11:nonroot
+WORKDIR /app
+COPY --from=extractor /workspace/app.jar /app/app.jar
+
+# Container-aware JVM options (adjust as needed)
+ENV JAVA_TOOL_OPTIONS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0"
+
 EXPOSE 8080
-
-ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/app.jar"]
+ENTRYPOINT ["java","-jar","/app/app.jar"]
