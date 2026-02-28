@@ -1,16 +1,14 @@
-# Java CI/CD with Maven -> build JAR, compute lowercase image name, build & push multi-arch image to GHCR,
-# scan with Trivy, capture image digest, and promote immutably dev -> stage -> prod.
+# Complete CI/CD workflow (GHCR variant) with immutable promotions using job outputs.
+# - build: Maven package + compute lowercase image name and short sha tag, upload JAR artifact
+# - build_and_push_dev: buildx multi-arch build, push :dev and :<sha>, capture digest and metadata artifact, optional Trivy scan
+# - promote_to_stage: pull by digest and retag to :stage and :<sha>, export outputs for downstream job
+# - promote_to_prod: depends only on promote_to_stage, reads outputs from promote_to_stage and retags to :prod and :<sha>
 #
-# Fixes in this version:
-# - build_and_push_dev now exposes job outputs: image_digest, image_name, sha_tag (passed through from build).
-# - promote jobs read image_name and sha_tag from needs.build_and_push_dev.outputs (so IMG and SHA_TAG are not empty).
-# - Push/promote jobs are skipped on pull_request events to avoid secret use on forks.
-#
-# Secrets (optional):
-# - GHCR_USERNAME
-# - GHCR_PAT
-
-name: Java CI/CD with Maven and GHCR (multi-arch + security scan)
+# Notes:
+# - Provide GHCR_PAT & GHCR_USERNAME secrets if you prefer a PAT; otherwise the workflow falls back to GITHUB_TOKEN.
+# - Push/promote jobs are skipped for pull_request events (secrets are masked in forked PRs).
+# - Ensure tools/scan-image.sh exists if you want Trivy scanning; the workflow will skip scanning if the script is not present.
+name: Java CI/CD with Maven and GHCR (multi-arch + immutable promotions)
 
 on:
   push:
@@ -50,9 +48,10 @@ jobs:
       - name: Set image sha tag
         id: set_tag
         run: |
+          # short sha tag (7 chars)
           echo "sha_tag=$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_OUTPUT
 
-      - name: Set lowercase image name
+      - name: Set lowercase image name (owner/repo -> lowercased)
         id: set_image
         run: |
           repo_lower=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
@@ -70,7 +69,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     environment: dev
-    # Job outputs: expose digest and pass through image_name and sha_tag from build
     outputs:
       image_digest: ${{ steps.build_image.outputs.digest }}
       image_name: ${{ needs.build.outputs.image_name }}
@@ -119,107 +117,120 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Save digest to file (artifact)
+      - name: Save digest and metadata artifact
         run: |
-          echo "${{ steps.build_image.outputs.digest }}" > image-digest.txt
-          echo "digest=${{ steps.build_image.outputs.digest }}"
-
+          DIGEST="${{ steps.build_image.outputs.digest }}"
+          echo "digest=${DIGEST}"
+          echo "${DIGEST}" > image-digest.txt
+          cat > image-metadata.json <<EOF
+{
+  "image": "${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}",
+  "digest": "${DIGEST}",
+  "sha_tag": "${{ needs.build.outputs.sha_tag }}"
+}
+EOF
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
         with:
           name: image-digest
-          path: image-digest.txt
+          path: |
+            image-digest.txt
+            image-metadata.json
 
-      - name: Scan image with Trivy (Docker-run method)
+      - name: Optional: Scan image with Trivy (if tools/scan-image.sh exists)
         run: |
-          chmod +x tools/scan-image.sh
-          IMAGE_REF="${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}@${{ steps.build_image.outputs.digest }}"
-          ./tools/scan-image.sh "$IMAGE_REF" trivy-report.json
+          if [ -x ./tools/scan-image.sh ]; then
+            IMAGE_REF="${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}@${{ steps.build_image.outputs.digest }}"
+            ./tools/scan-image.sh "$IMAGE_REF" trivy-report.json
+            echo "Trivy report generated"
+          else
+            echo "Scan script not present; skipping Trivy scan"
+          fi
 
-      - name: Upload Trivy report
+      - name: Upload Trivy report (if present)
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report
           path: trivy-report.json
 
   promote_to_stage:
-  name: Promote to stage (immutable via digest)
-  if: ${{ github.event_name != 'pull_request' }}
-  runs-on: ubuntu-latest
-  needs: build_and_push_dev
-  environment: stage
-  outputs:
-    image_digest: ${{ steps.set_outputs.outputs.image_digest }}
-    image_name: ${{ steps.set_outputs.outputs.image_name }}
-    sha_tag: ${{ steps.set_outputs.outputs.sha_tag }}
-  steps:
-    - name: Login to GHCR
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ secrets.GHCR_USERNAME || github.actor }}
-        password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+    name: Promote to stage (immutable via digest) and export outputs
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    needs: build_and_push_dev
+    environment: stage
+    outputs:
+      image_digest: ${{ steps.set_outputs.outputs.image_digest }}
+      image_name: ${{ steps.set_outputs.outputs.image_name }}
+      sha_tag: ${{ steps.set_outputs.outputs.sha_tag }}
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.GHCR_USERNAME || github.actor }}
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-    - name: Pull by digest and push stage & sha tags
-      id: promote_stage
-      run: |
-        set -e
-        REG="${{ env.REGISTRY }}"
-        IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
-        DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
-        SHA_TAG="${{ needs.build_and_push_dev.outputs.sha_tag }}"
+      - name: Pull by digest and push stage & sha tags
+        id: promote_stage
+        run: |
+          set -e
+          REG="${{ env.REGISTRY }}"
+          IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
+          DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
+          SHA_TAG="${{ needs.build.outputs.sha_tag }}"
 
-        echo "Promoting digest: ${DIGEST}"
-        if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
-          echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
-          exit 1
-        fi
+          echo "Promoting digest: ${DIGEST}"
+          if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
+            echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
+            exit 1
+          fi
 
-        docker pull "${REG}/${IMG}@${DIGEST}"
-        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:stage"
-        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
-        docker push "${REG}/${IMG}:stage"
-        docker push "${REG}/${IMG}:${SHA_TAG}"
+          docker pull "${REG}/${IMG}@${DIGEST}"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:stage"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
+          docker push "${REG}/${IMG}:stage"
+          docker push "${REG}/${IMG}:${SHA_TAG}"
 
-    - name: Set job outputs for promote_to_stage
-      id: set_outputs
-      run: |
-        # Export values from the upstream build_and_push_dev outputs so promote_to_prod can read them
-        echo "image_digest=${{ needs.build_and_push_dev.outputs.image_digest }}" >> $GITHUB_OUTPUT
-        echo "image_name=${{ needs.build_and_push_dev.outputs.image_name }}" >> $GITHUB_OUTPUT
-        echo "sha_tag=${{ needs.build_and_push_dev.outputs.sha_tag }}" >> $GITHUB_OUTPUT
+      - name: Set job outputs for promote_to_stage
+        id: set_outputs
+        run: |
+          # Pass through values from build_and_push_dev so promote_to_prod can read them from needs.promote_to_stage.outputs
+          echo "image_digest=${{ needs.build_and_push_dev.outputs.image_digest }}" >> $GITHUB_OUTPUT
+          echo "image_name=${{ needs.build_and_push_dev.outputs.image_name }}" >> $GITHUB_OUTPUT
+          echo "sha_tag=${{ needs.build_and_push_dev.outputs.sha_tag }}" >> $GITHUB_OUTPUT
 
-# promote_to_prod: depends only on promote_to_stage and reads outputs from it
-promote_to_prod:
-  name: Promote to prod (immutable via digest)
-  if: ${{ github.event_name != 'pull_request' }}
-  runs-on: ubuntu-latest
-  needs: promote_to_stage
-  environment: prod
-  steps:
-    - name: Login to GHCR
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ secrets.GHCR_USERNAME || github.actor }}
-        password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+  promote_to_prod:
+    name: Promote to prod (immutable via digest)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    needs: promote_to_stage
+    environment: prod
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.GHCR_USERNAME || github.actor }}
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-    - name: Pull by digest and push prod & sha tags
-      run: |
-        set -e
-        REG="${{ env.REGISTRY }}"
-        IMG="${{ needs.promote_to_stage.outputs.image_name }}"
-        DIGEST="${{ needs.promote_to_stage.outputs.image_digest }}"
-        SHA_TAG="${{ needs.promote_to_stage.outputs.sha_tag }}"
+      - name: Pull by digest and push prod & sha tags
+        run: |
+          set -e
+          REG="${{ env.REGISTRY }}"
+          IMG="${{ needs.promote_to_stage.outputs.image_name }}"
+          DIGEST="${{ needs.promote_to_stage.outputs.image_digest }}"
+          SHA_TAG="${{ needs.promote_to_stage.outputs.sha_tag }}"
 
-        echo "Promoting digest: ${DIGEST}"
-        if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
-          echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
-          exit 1
-        fi
+          echo "Promoting digest: ${DIGEST}"
+          if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
+            echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
+            exit 1
+          fi
 
-        docker pull "${REG}/${IMG}@${DIGEST}"
-        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:prod"
-        docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
-        docker push "${REG}/${IMG}:prod"
-        docker push "${REG}/${IMG}:${SHA_TAG}"
+          docker pull "${REG}/${IMG}@${DIGEST}"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:prod"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
+          docker push "${REG}/${IMG}:prod"
+          docker push "${REG}/${IMG}:${SHA_TAG}"
