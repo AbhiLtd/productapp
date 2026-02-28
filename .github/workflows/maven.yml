@@ -3,11 +3,6 @@
 # - build_and_push_dev: buildx multi-arch build, push :dev and :<sha>, capture digest and metadata artifact, optional Trivy scan
 # - promote_to_stage: pull by digest and retag to :stage and :<sha>, export outputs for downstream job
 # - promote_to_prod: depends only on promote_to_stage, reads outputs from promote_to_stage and retags to :prod and :<sha>
-#
-# Notes:
-# - Provide GHCR_PAT & GHCR_USERNAME secrets if you prefer a PAT; otherwise the workflow falls back to GITHUB_TOKEN.
-# - Push/promote jobs are skipped for pull_request events (secrets are masked in forked PRs).
-# - Ensure tools/scan-image.sh exists if you want Trivy scanning.
 name: Java CI/CD with Maven and GHCR (multi-arch + immutable promotions)
 
 on:
@@ -122,13 +117,8 @@ jobs:
           DIGEST="${{ steps.build_image.outputs.digest }}"
           echo "digest=${DIGEST}"
           echo "${DIGEST}" > image-digest.txt
-          cat > image-metadata.json <<EOF
-{
-  "image": "${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}",
-  "digest": "${DIGEST}",
-  "sha_tag": "${{ needs.build.outputs.sha_tag }}"
-}
-EOF
+          # create a small JSON without a heredoc to avoid YAML parsing issues
+          echo "{\"image\":\"${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}\",\"digest\":\"${DIGEST}\",\"sha_tag\":\"${{ needs.build.outputs.sha_tag }}\"}" > image-metadata.json
 
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
