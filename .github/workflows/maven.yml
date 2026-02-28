@@ -1,17 +1,5 @@
-# Java CI/CD with Maven -> build JAR, compute lowercase image name, build & push image to GHCR,
-# and promote image immutably dev -> stage -> prod.
-#
-# Notes:
-# - Compute image_name in the build job (lowercased owner/repo) and expose it via job outputs.
-# - Push/promote jobs read image_name from needs.build.outputs.image_name (no job-level env referencing env.*).
-# - Login prefers GHCR PAT (GHCR_USERNAME / GHCR_PAT) and falls back to GITHUB_TOKEN.
-# - Push/promote jobs are skipped for pull_request events (avoids secrets on forks).
-#
-# Secrets (optional):
-# - GHCR_USERNAME
-# - GHCR_PAT
-
-name: Java CI/CD with Maven and GHCR
+# CI/CD: Maven build -> upload JAR -> multi-arch build & push to GHCR -> scan -> immutable promote dev->stage->prod
+name: Java CI/CD with Maven and GHCR (multi-arch + security scan)
 
 on:
   push:
@@ -29,7 +17,7 @@ env:
 
 jobs:
   build:
-    name: Build (Maven) and upload artifact
+    name: Build (Maven) and set metadata
     runs-on: ubuntu-latest
     outputs:
       image_name: ${{ steps.set_image.outputs.image_name }}
@@ -51,13 +39,11 @@ jobs:
       - name: Set image sha tag
         id: set_tag
         run: |
-          # short sha tag (7 chars)
-          echo "sha_tag=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
+          echo "sha_tag=$(echo ${GITHUB_SHA} | cut -c1-7)" >> $GITHUB_OUTPUT
 
-      - name: Set lowercase image name (owner/repo -> lowercased)
+      - name: Set lowercase image name
         id: set_image
         run: |
-          # Convert GITHUB_REPOSITORY (Owner/Repo) to lowercase owner/repo for docker tags
           repo_lower=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           echo "image_name=${repo_lower}" >> $GITHUB_OUTPUT
 
@@ -68,7 +54,7 @@ jobs:
           path: target/*.jar
 
   build_and_push_dev:
-    name: Build & push Docker image (dev)
+    name: Build & push Docker image (dev) + scan
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     needs: build
@@ -98,12 +84,12 @@ jobs:
           username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Show image reference
+      - name: Show image refs
         run: |
-          echo "Pushing image: ${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}:dev"
-          echo "Also tagging with: ${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}:${{ needs.build.outputs.sha_tag }}"
+          echo "Image base: ${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}"
+          echo "Tags: dev and ${{ needs.build.outputs.sha_tag }}"
 
-      - name: Build & push image (dev + sha) and capture digest
+      - name: Build & push image (multi-arch) and capture digest
         id: build_image
         uses: docker/build-push-action@v4
         with:
@@ -119,6 +105,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Save digest to file (artifact)
+        run: |
+          echo "${{ steps.build_image.outputs.digest }}" > image-digest.txt
+          echo "digest=${{ steps.build_image.outputs.digest }}"
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt
+
+      - name: Scan image with Trivy (Docker-run method)
+        # This step runs the helper script which invokes Trivy in a container and writes JSON
+        run: |
+          chmod +x tools/scan-image.sh
+          IMAGE_REF="${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}@${{ steps.build_image.outputs.digest }}"
+          ./tools/scan-image.sh "$IMAGE_REF" trivy-report.json
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.json
+
   promote_to_stage:
     name: Promote to stage (immutable via digest)
     if: ${{ github.event_name != 'pull_request' }}
@@ -126,14 +134,14 @@ jobs:
     needs: build_and_push_dev
     environment: stage
     steps:
-      - name: Login to GHCR (prefer PAT, fallback to GITHUB_TOKEN)
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Pull by digest, tag and push stage & sha
+      - name: Pull by digest and push stage & sha tags
         run: |
           set -e
           REG="${{ env.REGISTRY }}"
@@ -141,13 +149,10 @@ jobs:
           DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
           SHA_TAG="${{ needs.build.outputs.sha_tag }}"
 
-          echo "Using digest: $DIGEST"
-
-          # Pull exact image by digest, tag for stage and push tags
+          echo "Promoting digest: ${DIGEST}"
           docker pull "${REG}/${IMG}@${DIGEST}"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:stage"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
-
           docker push "${REG}/${IMG}:stage"
           docker push "${REG}/${IMG}:${SHA_TAG}"
 
@@ -158,14 +163,14 @@ jobs:
     needs: promote_to_stage
     environment: prod
     steps:
-      - name: Login to GHCR (prefer PAT, fallback to GITHUB_TOKEN)
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.GHCR_USERNAME || github.actor }}
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Pull by digest, tag and push prod & sha
+      - name: Pull by digest and push prod & sha tags
         run: |
           set -e
           REG="${{ env.REGISTRY }}"
@@ -173,11 +178,9 @@ jobs:
           DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
           SHA_TAG="${{ needs.build.outputs.sha_tag }}"
 
-          echo "Using digest: $DIGEST"
-
+          echo "Promoting digest: ${DIGEST}"
           docker pull "${REG}/${IMG}@${DIGEST}"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:prod"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
-
           docker push "${REG}/${IMG}:prod"
           docker push "${REG}/${IMG}:${SHA_TAG}"
