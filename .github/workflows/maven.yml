@@ -7,7 +7,7 @@
 # Notes:
 # - Provide GHCR_PAT & GHCR_USERNAME secrets if you prefer a PAT; otherwise the workflow falls back to GITHUB_TOKEN.
 # - Push/promote jobs are skipped for pull_request events (secrets are masked in forked PRs).
-# - Ensure tools/scan-image.sh exists if you want Trivy scanning; the workflow will skip scanning if the script is not present.
+# - Ensure tools/scan-image.sh exists if you want Trivy scanning.
 name: Java CI/CD with Maven and GHCR (multi-arch + immutable promotions)
 
 on:
@@ -64,7 +64,7 @@ jobs:
           path: target/*.jar
 
   build_and_push_dev:
-    name: Build & push Docker image (dev) + scan
+    name: Build & push Docker image (dev) + optional scan
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     needs: build
@@ -129,6 +129,7 @@ jobs:
   "sha_tag": "${{ needs.build.outputs.sha_tag }}"
 }
 EOF
+
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
         with:
@@ -138,17 +139,18 @@ EOF
             image-metadata.json
 
       - name: Optional: Scan image with Trivy (if tools/scan-image.sh exists)
+        id: run_trivy
         run: |
           if [ -x ./tools/scan-image.sh ]; then
             IMAGE_REF="${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}@${{ steps.build_image.outputs.digest }}"
             ./tools/scan-image.sh "$IMAGE_REF" trivy-report.json
-            echo "Trivy report generated"
+            echo "found=true" >> $GITHUB_OUTPUT
           else
-            echo "Scan script not present; skipping Trivy scan"
+            echo "found=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Upload Trivy report (if present)
-        if: ${{ always() }}
+        if: ${{ steps.run_trivy.outputs.found == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report
