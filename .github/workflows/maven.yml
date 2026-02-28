@@ -1,4 +1,15 @@
-# CI/CD: Maven build -> upload JAR -> multi-arch build & push to GHCR -> scan -> immutable promote dev->stage->prod
+# Java CI/CD with Maven -> build JAR, compute lowercase image name, build & push multi-arch image to GHCR,
+# scan with Trivy, capture image digest, and promote immutably dev -> stage -> prod.
+#
+# Fixes in this version:
+# - build_and_push_dev now exposes job outputs: image_digest, image_name, sha_tag (passed through from build).
+# - promote jobs read image_name and sha_tag from needs.build_and_push_dev.outputs (so IMG and SHA_TAG are not empty).
+# - Push/promote jobs are skipped on pull_request events to avoid secret use on forks.
+#
+# Secrets (optional):
+# - GHCR_USERNAME
+# - GHCR_PAT
+
 name: Java CI/CD with Maven and GHCR (multi-arch + security scan)
 
 on:
@@ -59,8 +70,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     environment: dev
+    # Job outputs: expose digest and pass through image_name and sha_tag from build
     outputs:
       image_digest: ${{ steps.build_image.outputs.digest }}
+      image_name: ${{ needs.build.outputs.image_name }}
+      sha_tag: ${{ needs.build.outputs.sha_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -109,6 +123,7 @@ jobs:
         run: |
           echo "${{ steps.build_image.outputs.digest }}" > image-digest.txt
           echo "digest=${{ steps.build_image.outputs.digest }}"
+
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
         with:
@@ -116,11 +131,11 @@ jobs:
           path: image-digest.txt
 
       - name: Scan image with Trivy (Docker-run method)
-        # This step runs the helper script which invokes Trivy in a container and writes JSON
         run: |
           chmod +x tools/scan-image.sh
           IMAGE_REF="${{ env.REGISTRY }}/${{ needs.build.outputs.image_name }}@${{ steps.build_image.outputs.digest }}"
           ./tools/scan-image.sh "$IMAGE_REF" trivy-report.json
+
       - name: Upload Trivy report
         uses: actions/upload-artifact@v4
         with:
@@ -145,11 +160,17 @@ jobs:
         run: |
           set -e
           REG="${{ env.REGISTRY }}"
-          IMG="${{ needs.build.outputs.image_name }}"
+          IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
           DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
-          SHA_TAG="${{ needs.build.outputs.sha_tag }}"
+          SHA_TAG="${{ needs.build_and_push_dev.outputs.sha_tag }}"
 
           echo "Promoting digest: ${DIGEST}"
+          # validate variables
+          if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
+            echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
+            exit 1
+          fi
+
           docker pull "${REG}/${IMG}@${DIGEST}"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:stage"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
@@ -174,11 +195,16 @@ jobs:
         run: |
           set -e
           REG="${{ env.REGISTRY }}"
-          IMG="${{ needs.build.outputs.image_name }}"
+          IMG="${{ needs.build_and_push_dev.outputs.image_name }}"
           DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
-          SHA_TAG="${{ needs.build.outputs.sha_tag }}"
+          SHA_TAG="${{ needs.build_and_push_dev.outputs.sha_tag }}"
 
           echo "Promoting digest: ${DIGEST}"
+          if [ -z "$IMG" ] || [ -z "$DIGEST" ]; then
+            echo "ERROR: IMG or DIGEST is empty. IMG='$IMG' DIGEST='$DIGEST'"
+            exit 1
+          fi
+
           docker pull "${REG}/${IMG}@${DIGEST}"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:prod"
           docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
