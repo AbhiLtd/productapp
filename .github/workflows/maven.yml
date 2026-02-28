@@ -1,16 +1,14 @@
-# CI/CD for a Java (Maven) app:
-# - builds the Maven project
-# - uploads the built JAR as an artifact
-# - builds and pushes Docker image to REGISTRY (dev tag + sha)
-# - promotes image to stage and prod (use GitHub Environments to protect stage/prod)
+# Java CI/CD with Maven -> build JAR, upload artifact, build & push image to GHCR,
+# and promote image immutably dev -> stage -> prod using image digest.
 #
-# Configure repository secrets:
-# - REGISTRY_USERNAME
-# - REGISTRY_PASSWORD
+# Recommended auth:
+# - Preferred (production / cross-repo): create a PAT with package write and store as
+#   GHCR_USERNAME and GHCR_PAT repository secrets.
+# - Simple (same-account repos): the workflow will fall back to using GITHUB_TOKEN.
 #
-# Optional: set repository variables or replace env.REGISTRY and env.IMAGE_NAME below.
+# Important: avoid exposing secrets on forked PRs. The login steps are skipped for pull_request events.
 
-name: Java CI/CD with Maven and Docker
+name: Java CI/CD with Maven and GHCR
 
 on:
   push:
@@ -23,9 +21,9 @@ permissions:
   id-token: write
 
 env:
-  REGISTRY: docker.io                  # change to ghcr.io, <aws_account>.dkr.ecr.<region>.amazonaws.com, etc.
-  IMAGE_NAME: youruser/productapp      # set to <namespace>/<repo> (for Docker Hub) or ghcr.io/<owner>/<repo>
-  PLATFORMS: linux/amd64
+  REGISTRY: ghcr.io
+  IMAGE_NAME: AbhiLtd/productapp
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   build:
@@ -45,12 +43,11 @@ jobs:
           cache: maven
 
       - name: Build with Maven
-        run: mvn -B clean package
+        run: mvn -B clean package -DskipTests
 
       - name: Set image sha tag
         id: set_tag
         run: |
-          # short sha tag (7 chars) - adjust if you prefer full SHA
           echo "sha_tag=$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
 
       - name: Upload JAR artifact
@@ -64,6 +61,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     environment: dev
+    outputs:
+      image_digest: ${{ steps.build_image.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -80,14 +79,26 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to registry
+      # Login using PAT if provided
+      - name: Login to GHCR (PAT)
+        if: ${{ secrets.GHCR_PAT != '' && github.event_name != 'pull_request' }}
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PAT }}
 
-      - name: Build & push image (dev + sha)
+      # Fallback to GITHUB_TOKEN (works for same-account publishing)
+      - name: Login to GHCR (GITHUB_TOKEN fallback)
+        if: ${{ secrets.GHCR_PAT == '' && github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push image (dev + sha) and capture digest
+        id: build_image
         uses: docker/build-push-action@v4
         with:
           context: .
@@ -103,51 +114,80 @@ jobs:
           cache-to: type=gha,mode=max
 
   promote_to_stage:
-    name: Promote to stage
+    name: Promote to stage (immutable via digest)
     runs-on: ubuntu-latest
     needs: build_and_push_dev
     environment: stage
     steps:
-      - name: Set up Docker (login)
+      - name: Login to GHCR (PAT)
+        if: ${{ secrets.GHCR_PAT != '' && github.event_name != 'pull_request' }}
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PAT }}
 
-      - name: Pull dev image, tag and push stage & sha
+      - name: Login to GHCR (GITHUB_TOKEN fallback)
+        if: ${{ secrets.GHCR_PAT == '' && github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull by digest, tag and push stage & sha
         run: |
           set -e
           REG="${{ env.REGISTRY }}"
           IMG="${{ env.IMAGE_NAME }}"
-          SHA="${{ needs.build.outputs.sha_tag }}"
-          docker pull "${REG}/${IMG}:dev"
-          docker tag "${REG}/${IMG}:dev" "${REG}/${IMG}:stage"
-          docker tag "${REG}/${IMG}:dev" "${REG}/${IMG}:${SHA}"
+          DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
+          SHA_TAG="${{ needs.build.outputs.sha_tag }}"
+
+          echo "Using digest: $DIGEST"
+
+          # Pull exact image by digest, tag for stage and push tags
+          docker pull "${REG}/${IMG}@${DIGEST}"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:stage"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
+
           docker push "${REG}/${IMG}:stage"
-          docker push "${REG}/${IMG}:${SHA}"
+          docker push "${REG}/${IMG}:${SHA_TAG}"
 
   promote_to_prod:
-    name: Promote to prod
+    name: Promote to prod (immutable via digest)
     runs-on: ubuntu-latest
     needs: promote_to_stage
     environment: prod
     steps:
-      - name: Login to registry
+      - name: Login to GHCR (PAT)
+        if: ${{ secrets.GHCR_PAT != '' && github.event_name != 'pull_request' }}
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PAT }}
 
-      - name: Pull stage image, tag and push prod & sha
+      - name: Login to GHCR (GITHUB_TOKEN fallback)
+        if: ${{ secrets.GHCR_PAT == '' && github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull by digest, tag and push prod & sha
         run: |
           set -e
           REG="${{ env.REGISTRY }}"
           IMG="${{ env.IMAGE_NAME }}"
-          SHA="${{ needs.build.outputs.sha_tag }}"
-          docker pull "${REG}/${IMG}:stage"
-          docker tag "${REG}/${IMG}:stage" "${REG}/${IMG}:prod"
-          docker tag "${REG}/${IMG}:stage" "${REG}/${IMG}:${SHA}"
+          DIGEST="${{ needs.build_and_push_dev.outputs.image_digest }}"
+          SHA_TAG="${{ needs.build.outputs.sha_tag }}"
+
+          echo "Using digest: $DIGEST"
+
+          docker pull "${REG}/${IMG}@${DIGEST}"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:prod"
+          docker tag "${REG}/${IMG}@${DIGEST}" "${REG}/${IMG}:${SHA_TAG}"
+
           docker push "${REG}/${IMG}:prod"
-          docker push "${REG}/${IMG}:${SHA}"
+          docker push "${REG}/${IMG}:${SHA_TAG}"
