@@ -25,4 +25,9 @@ public class ProductController {
 		return new ResponseEntity<>(allProducts,HttpStatus.OK);
 	}
 
+	@GetMapping("/health")
+    public String health() {
+        return "OK";
+    }
+
 }
