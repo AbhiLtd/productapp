@@ -211,7 +211,7 @@ jobs:
   promote_to_prod:
     name: Promote Image to Prod
     if: github.ref == 'refs/heads/main'
-    needs: stage_checks
+    needs: [stage_checks, promote_to_stage]
     runs-on: ubuntu-latest
     environment: prod
 
